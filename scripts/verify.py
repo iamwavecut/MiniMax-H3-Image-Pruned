@@ -1,13 +1,14 @@
 """Check the pruned MiniMax-H3-Image against the original release, and time both.
 
     python verify.py reference --source ./MiniMax-H3-Image --work ./verify
-    python verify.py pruned --pruned ./MiniMax-H3-Image-Pruned --work ./verify [--resident]
+    python verify.py pruned --source ./MiniMax-H3-Image --pruned ./MiniMax-H3-Image-Pruned --work ./verify [--resident]
     python verify.py compare --work ./verify
 
 `reference` runs the official Modular Diffusers pipeline (bfloat16, auto CPU offload) on the cases below and records
-every transformer call. `pruned` runs the pruned pipeline on the same cases and also feeds the recorded calls to the
-pruned transformer, with and without `skip_dead_rows`. `compare` reports, per case: whether the text conditioning, the
-transformer outputs and the images are bit-identical, and the time and GPU memory of each run.
+every transformer call. `pruned` loads the pruned checkpoint with the same stock classes, runs the same cases and feeds
+the recorded calls to the pruned transformer. `compare` reports, per case: whether the text conditioning, the
+transformer outputs and the images are bit-identical (and how far they differ when they are not), and the time and
+GPU memory of each run.
 """
 
 from __future__ import annotations
@@ -42,7 +43,10 @@ def log(**kw):
 
 
 class Peak:
-    """Whole-GPU memory peak from NVML, sampled every 5 ms."""
+    """Whole-GPU memory peak from NVML, sampled every 50 ms.
+
+    Polling every 5 ms slowed the Qwen3-VL vision tower (many small kernels) by seconds on driver 615.
+    """
 
     def __init__(self, index=0):
         import pynvml
@@ -54,7 +58,7 @@ class Peak:
     def _run(self):
         while not self._stop.is_set():
             self.peak = max(self.peak, self._nvml.nvmlDeviceGetMemoryInfo(self._handle).used)
-            time.sleep(0.005)
+            time.sleep(0.05)
 
     def __enter__(self):
         self.peak = self._nvml.nvmlDeviceGetMemoryInfo(self._handle).used
@@ -156,50 +160,52 @@ def reference(args):
     print("REFERENCE_DONE", flush=True)
 
 
+def load_stock(path: Path, resident: bool):
+    """The checkpoint at `path` in the stock `ModularPipeline`, as the official card loads the original."""
+    from diffusers import ComponentsManager, ModularPipeline
+
+    manager = ComponentsManager()
+    if not resident:
+        manager.enable_auto_cpu_offload(device="cuda")
+    pipe = ModularPipeline.from_pretrained(str(path), components_manager=manager)
+    pipe.load_components(dtype=torch.bfloat16, pretrained_model_name_or_path=str(path))
+    for name in ("transformer", "text_encoder", "vae", "tokenizer", "processor", "scheduler"):
+        if getattr(pipe, name, None) is None:
+            raise RuntimeError(f"{name} did not load")
+    if resident:
+        pipe.to("cuda")
+    return pipe
+
+
 @torch.no_grad()
 def transformer_check(transformer, ref_dir: Path):
-    """Feed the recorded reference calls to the pruned transformer, with and without `skip_dead_rows`."""
+    """Feed the recorded reference calls to the pruned transformer."""
     rows = []
     for calls_file in sorted(ref_dir.glob("*.calls.pt")):
         for call in torch.load(calls_file, weights_only=False):
             kwargs = {k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in call["kwargs"].items()}
             expected = call["output"].float()
-            for skip in (False, True):
-                transformer.skip_dead_rows = skip
-                got = transformer(**kwargs)
-                got = (got[0] if isinstance(got, tuple) else got.sample).float().cpu()
-                timestep_indices = kwargs["timestep_indices"].cpu()
-                image_indices = kwargs["image_indices"].cpu()
-                n_ref = int((timestep_indices[image_indices] == kwargs["timestep"].numel() - 1).sum()) \
-                    if kwargs["timestep"].numel() > 1 else 0
-                live = slice(n_ref if skip else 0, None)  # reference rows are zero with skip_dead_rows
-                diff = (got[:, live] - expected[:, live]).abs()
-                rows.append({"case": calls_file.name.split(".")[0], "step": int(kwargs["pdd_step_index"]),
-                             "skip_dead_rows": skip, "identical": bool(torch.equal(got[:, live], expected[:, live])),
-                             "max_abs": float(diff.max()),
-                             "rel": float(diff.norm() / expected[:, live].norm())})
-    transformer.skip_dead_rows = True
+            got = transformer(**kwargs)
+            got = (got[0] if isinstance(got, tuple) else got.sample).float().cpu()
+            diff = (got - expected).abs()
+            rows.append({"case": calls_file.name.split(".")[0], "step": int(kwargs["pdd_step_index"]),
+                         "edit": kwargs["timestep"].numel() > 1, "identical": bool(torch.equal(got, expected)),
+                         "max_abs": float(diff.max()), "rel": float(diff.norm() / expected.norm())})
     return rows
 
 
 def pruned(args):
-    from minimax_h3_image_pruned import load_pipeline
-
-    pipe = load_pipeline(str(args.pruned), offload=not args.resident)
+    pipe = load_stock(args.pruned, args.resident)
     label = "pruned-resident" if args.resident else "pruned"
-    log(loaded=label, te_layers=len(pipe.text_encoder.model.language_model.layers))
+    log(loaded=label, transformer=type(pipe.transformer).__name__,
+        time_embed_dim=pipe.transformer.config.time_embed_dim,
+        te_layers=pipe.text_encoder.config.text_config.num_hidden_layers)
     cases = CASES if not args.resident else [c | {"capture": False} for c in CASES]
     run_cases(pipe, args.source or args.pruned, args.work / label, cases, label)
-    if args.resident:
-        print("PRUNED_DONE", flush=True)
-        return
-    rows = transformer_check(pipe.transformer, args.work / "reference")
-    (args.work / "transformer_check.json").write_text(json.dumps(rows, indent=1))
-    log(transformer_check={"calls": len(rows), "identical": sum(r["identical"] for r in rows)})
-    # The full last block end to end: the images should match the reference bit for bit.
-    pipe.transformer.skip_dead_rows = False
-    full_cases = [c | {"id": c["id"] + "_full", "capture": False} for c in CASES if c["capture"]]
-    run_cases(pipe, args.source or args.pruned, args.work / label, full_cases, label + "-full", warmup=False)
+    if not args.resident:
+        rows = transformer_check(pipe.transformer, args.work / "reference")
+        (args.work / "transformer_check.json").write_text(json.dumps(rows, indent=1))
+        log(transformer_check={"calls": len(rows), "identical": sum(r["identical"] for r in rows)})
     print("PRUNED_DONE", flush=True)
 
 
@@ -225,10 +231,10 @@ def compare(args):
     ref = args.work / "reference"
     result = {"images": {}, "conditioning": {}, "runs": []}
     for case in CASES:
-        for label, suffix in (("pruned", ""), ("pruned", "_full"), ("pruned-resident", "")):
-            got = args.work / label / f"{case['id']}{suffix}.png"
+        for label in ("pruned", "pruned-resident"):
+            got = args.work / label / f"{case['id']}.png"
             if got.exists() and (ref / f"{case['id']}.png").exists():
-                result["images"][f"{label}/{case['id']}{suffix}"] = image_diff(ref / f"{case['id']}.png", got)
+                result["images"][f"{label}/{case['id']}"] = image_diff(ref / f"{case['id']}.png", got)
         calls_ref, calls_got = ref / f"{case['id']}.calls.pt", args.work / "pruned" / f"{case['id']}.calls.pt"
         if calls_ref.exists() and calls_got.exists():
             result["conditioning"][case["id"]] = conditioning_diff(calls_ref, calls_got)
@@ -237,11 +243,12 @@ def compare(args):
     check = args.work / "transformer_check.json"
     if check.exists():
         rows = json.loads(check.read_text())
-        for skip in (False, True):
-            sel = [r for r in rows if r["skip_dead_rows"] == skip]
-            result[f"transformer_skip_{str(skip).lower()}"] = {
-                "calls": len(sel), "identical": sum(r["identical"] for r in sel),
-                "max_abs": max(r["max_abs"] for r in sel), "max_rel": max(r["rel"] for r in sel)}
+        for kind, edit in (("t2i", False), ("edit", True)):
+            sel = [r for r in rows if r["edit"] == edit]
+            if sel:
+                result[f"transformer_{kind}"] = {
+                    "calls": len(sel), "identical": sum(r["identical"] for r in sel),
+                    "max_abs": max(r["max_abs"] for r in sel), "max_rel": max(r["rel"] for r in sel)}
     (args.work / "compare.json").write_text(json.dumps(result, indent=1))
     print(json.dumps(result, indent=1))
 

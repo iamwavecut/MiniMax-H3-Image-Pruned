@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minimax-h3-image-pruned"
-version = "0.1.0"
-description = "MiniMax-H3-Image with tabulated AdaLN modulation and a 50-layer text encoder: build and load scripts for Diffusers and Transformers"
+version = "0.2.0"
+description = "Build and verify MiniMax-H3-Image-Pruned: a smaller MiniMax-H3-Image checkpoint that stock Diffusers and Transformers load"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

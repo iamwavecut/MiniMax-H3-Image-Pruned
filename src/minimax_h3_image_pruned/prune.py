@@ -3,17 +3,22 @@
     minimax-h3-image-prune --output ./MiniMax-H3-Image-Pruned [--source ./MiniMax-H3-Image] [--device cuda]
 
 Without `--source` the needed files of `MiniMaxAI/MiniMax-H3-Image` are downloaded first (about 135 GB). The output is a
-Modular Diffusers repository:
+Modular Diffusers repository that the stock `MiniMaxH3ImageTransformer2DModel` and `Qwen3VLForConditionalGeneration`
+load as they are:
 
-* `transformer/`: the diffusers transformer without `transformer_blocks.*.adaln_proj.linear`, `time_embedder` and
-  `norm_out.linear`, plus the modulation tables that replace them. Every kept tensor is a byte copy.
-* `text_encoder/`: the Qwen3-VL conditioner without decoder layers 50-63 and `lm_head`. The pipeline reads
-  `hidden_states[50]`, the output of layer 49, so those weights never contribute.
+* `transformer/`: `time_embed_dim` 2688 -> 8 and `time_embed_hidden_dim` 5376 -> 16. The new `time_embedder` turns each
+  timestep of the sampling grid into a one-hot code (see `timestep_code`), and column k of every `adaln_proj.linear`
+  and of `norm_out.linear` holds the original projection's output for grid timestep k, divided by 32. Every other
+  tensor is a byte copy.
+* `text_encoder/`: the Qwen3-VL conditioner with decoder layers 0-50 and without `lm_head` (tied to the input
+  embedding). The pipeline reads `hidden_states[50]`, the output of layer 49; layer 50 stays because the pipeline
+  refuses a conditioner with 50 layers or fewer.
 * `vae/`, `tokenizer/`, `processor/`, `scheduler/`: unchanged copies.
 
-The tables are computed on `--device` with the original modules and the matrix shapes the pipeline uses. Build them on
-the GPU type you run on to make the pruned transformer bit-identical to the original one there; on another GPU type the
-two differ by the original model's own cross-device rounding (single bfloat16 ulps in a few table entries).
+The original projection outputs are computed on `--device` with the original modules, in the shapes the pipeline
+calls them with: one row per text-to-image step, two rows (step, reference) per edit step. The stored value for a step
+timestep is the text-to-image one, so text-to-image results are bit-identical to the original's on the build GPU type;
+in an edit the step rows can differ from the original's two-row result by single rounding steps.
 """
 
 from __future__ import annotations
@@ -26,11 +31,10 @@ import shutil
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 
-from .modeling import NUM_TAGS
 from .safetensors_io import NewTensor, read_checkpoint, write_sharded
+from .timestep_code import CODE, build_time_embedder, check_codes, code_dims, codes
 
 SOURCE_REPO = "MiniMaxAI/MiniMax-H3-Image"
 SOURCE_PATTERNS = [
@@ -44,11 +48,11 @@ SOURCE_PATTERNS = [
     "LICENSE",
 ]
 TEXT_ENCODER_LAYER = 50  # the transformer is conditioned on `hidden_states[50]`
+TEXT_ENCODER_KEEP = TEXT_ENCODER_LAYER + 1  # the stock pipeline needs more than 50 decoder layers
 NOTICE_LINE = (
     "MiniMax-H3-Image is licensed under the MiniMax-H3-Image Community License Agreement, "
     "Copyright © 2026 MiniMax. All Rights Reserved."
 )
-MODULE_FILE = "modeling_minimax_h3_image_pruned.py"
 
 
 def log(msg: str) -> None:
@@ -94,7 +98,7 @@ def timestep_plans(source: Path) -> list[list[float]]:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Modulation tables
+# AdaLN projections
 
 
 class _Reader:
@@ -104,8 +108,7 @@ class _Reader:
         from safetensors import safe_open
 
         self._open = safe_open
-        index = json.loads(next(folder.glob("*.safetensors.index.json")).read_text())["weight_map"]
-        self._map = {name: folder / shard for name, shard in index.items()}
+        self._map = {t.name: t.path for t in read_checkpoint(folder)}
         self._files = {}
 
     def get(self, name: str) -> torch.Tensor:
@@ -115,97 +118,149 @@ class _Reader:
         return self._files[path].get_tensor(name)
 
 
+def _code_rows(plans, outputs, grid):
+    """Row of `outputs` (one tensor per plan, one row per plan timestep) for each grid timestep.
+
+    A step timestep takes its row from the single-timestep (text-to-image) plan. A timestep that occurs only in
+    multi-timestep plans (the edit reference timestep) must have the same row in all of them.
+    """
+    rows = []
+    for value in grid:
+        single = [out[0] for plan, out in zip(plans, outputs) if plan == [value]]
+        shared = [out[plan.index(value)] for plan, out in zip(plans, outputs) if value in plan and len(plan) > 1]
+        if single:
+            rows.append(single[0])
+            continue
+        if not all(torch.equal(row, shared[0]) for row in shared):
+            raise RuntimeError(f"timestep {value}: the multi-timestep plans disagree on its row")
+        rows.append(shared[0])
+    return torch.stack(rows)
+
+
+def _coded_weight(rows: torch.Tensor, columns: int) -> torch.Tensor:
+    """`(out_features, columns)` bfloat16 weight whose column k is `rows[k] / CODE`; checked to be exact."""
+    weight = torch.zeros(rows.shape[1], columns, dtype=torch.float32)
+    weight[:, : rows.shape[0]] = rows.float().T / CODE
+    weight = weight.to(torch.bfloat16)
+    if not torch.equal((weight[:, : rows.shape[0]].float() * CODE).to(torch.bfloat16).T, rows):
+        raise RuntimeError("a projection output is not exactly representable as bfloat16 value / 32")
+    return weight
+
+
 @torch.no_grad()
-def build_tables(transformer_dir: Path, plans: list[list[float]], device: str):
-    """`(block_tables, norm_out_table)`: what `adaln_proj` and `norm_out.linear` return for every timestep set.
+def build_projections(transformer_dir: Path, plans: list[list[float]], device: str):
+    """Original AdaLN projection outputs per plan, and the coded `time_embedder` and projection weights.
 
     Mirrors `MiniMaxH3ImageTransformer2DModel.forward` loaded in bfloat16: `time_proj` and the float32
-    `time_embedder` on the `timestep` tensor of the call, then each bfloat16 projection on that `temb`.
+    `time_embedder` on the `timestep` tensor of the call, then each bfloat16 projection of `silu(temb)`.
+    Returns `(new_tensors, report)`.
     """
     from diffusers.models.embeddings import TimestepEmbedding, Timesteps
-    from diffusers.models.modeling_utils import get_parameter_dtype
-    from diffusers.models.transformers.transformer_minimax_h3_image import (
-        MINIMAX_H3_MODALITY_NUM,
-        MiniMaxH3ImageAdaLayerNormModulation,
-    )
+    from diffusers.models.transformers.transformer_minimax_h3_image import MiniMaxH3ImageAdaLayerNormModulation
 
     cfg = json.loads((transformer_dir / "config.json").read_text())
-    hidden, temb_dim = cfg["hidden_size"], cfg["time_embed_dim"]
+    hidden, temb_dim, freq_dim = cfg["hidden_size"], cfg["time_embed_dim"], cfg["freq_dim"]
+    grid = sorted({value for plan in plans for value in plan})
+    code_hidden, code_dim = code_dims(len(grid))
     reader = _Reader(transformer_dir)
 
     def load(module, prefix, dtype):
         module.load_state_dict({k: reader.get(f"{prefix}.{k}") for k in module.state_dict()})
         return module.to(device=device, dtype=dtype).eval()
 
-    time_proj = Timesteps(num_channels=cfg["freq_dim"], flip_sin_to_cos=True, downscale_freq_shift=0)
+    time_proj = Timesteps(num_channels=freq_dim, flip_sin_to_cos=True, downscale_freq_shift=0)
     time_embedder = load(
-        TimestepEmbedding(in_channels=cfg["freq_dim"], time_embed_dim=cfg["time_embed_hidden_dim"], out_dim=temb_dim),
+        TimestepEmbedding(in_channels=freq_dim, time_embed_dim=cfg["time_embed_hidden_dim"], out_dim=temb_dim),
         "time_embedder",
         torch.float32,
     )
-    tembs = []
+    acts = []
     for plan in plans:
-        timestep = torch.tensor(plan, dtype=torch.float32, device=device)
-        temb = time_proj(timestep)
-        tembs.append(time_embedder(temb.to(get_parameter_dtype(time_embedder))))
+        temb = time_embedder(time_proj(torch.tensor(plan, dtype=torch.float32, device=device)))
+        acts.append(torch.nn.functional.silu(temb).to(torch.bfloat16))
 
-    block_tables = []
-    modulation = MiniMaxH3ImageAdaLayerNormModulation(time_embed_dim=temb_dim, hidden_size=hidden)
+    embedder_state = build_time_embedder(grid, freq_dim)
+    log(f"time_embedder codes exact: {check_codes(embedder_state, grid, freq_dim, device)}")
+    new = {f"time_embedder.{k}": v for k, v in embedder_state.items()}
+    coded_embedder = TimestepEmbedding(in_channels=freq_dim, time_embed_dim=code_hidden, out_dim=code_dim)
+    coded_embedder.load_state_dict(embedder_state)
+    coded_embedder = coded_embedder.to(device=device, dtype=torch.float32).eval()
+    plan_codes = [codes(time_proj, coded_embedder, plan, device) for plan in plans]  # what the stock forward feeds
+
+    report = {"grid": grid, "plans": [{"timesteps": plan, "rows": len(plan), "identical_rows": 0, "differing": 0}
+                                      for plan in plans]}
+
+    def project(name, original, coded_linear):
+        outputs = [original(act).cpu() for act in acts]  # one (len(plan), out_features) tensor per plan
+        weight = _coded_weight(_code_rows(plans, outputs, grid), code_dim)
+        new[f"{name}.weight"] = weight
+        new[f"{name}.bias"] = torch.zeros(weight.shape[0], dtype=torch.bfloat16)
+        coded_linear.weight.copy_(weight)
+        coded_linear.bias.zero_()
+        for entry, out, plan_code in zip(report["plans"], outputs, plan_codes):
+            got = coded_linear(plan_code).cpu()
+            entry["identical_rows"] += sum(bool(torch.equal(g, o)) for g, o in zip(got, out))
+            entry["differing"] += int((got != out).sum())
+
+    modulation = MiniMaxH3ImageAdaLayerNormModulation(time_embed_dim=temb_dim, hidden_size=hidden).to(device)
+    coded = torch.nn.Linear(code_dim, modulation.linear.out_features, bias=True, device=device, dtype=torch.bfloat16)
     for i in range(cfg["num_layers"]):
-        load(modulation, f"transformer_blocks.{i}.adaln_proj", torch.bfloat16)
-        rows = []
-        for plan, temb in zip(plans, tembs):
-            full = torch.cat(modulation(temb), dim=-1)  # (len(plan) * 3, 6 * hidden), rows [t0 m0, t0 m1, t0 m2, ...]
-            full = full.view(len(plan), MINIMAX_H3_MODALITY_NUM, 6 * hidden)[:, :NUM_TAGS]
-            rows.append(full.reshape(len(plan) * NUM_TAGS, 6 * hidden))
-        block_tables.append(torch.cat(rows).cpu())
+        linear = load(modulation, f"transformer_blocks.{i}.adaln_proj", torch.bfloat16).linear
+        project(f"transformer_blocks.{i}.adaln_proj.linear", linear, coded)
         if i % 10 == 9:
-            log(f"modulation tables: {i + 1}/{cfg['num_layers']} blocks")
-
+            log(f"adaln projections: {i + 1}/{cfg['num_layers']} blocks")
     out_linear = load(torch.nn.Linear(temb_dim, 2 * hidden, bias=True), "norm_out.linear", torch.bfloat16)
-    out_rows = [out_linear(torch.nn.functional.silu(temb).to(get_parameter_dtype(out_linear))) for temb in tembs]
-    return block_tables, torch.cat(out_rows).cpu()
+    project("norm_out.linear", out_linear, torch.nn.Linear(code_dim, 2 * hidden, device=device, dtype=torch.bfloat16))
+
+    projections = cfg["num_layers"] + 1
+    for entry in report["plans"]:
+        entry["rows"] *= projections
+    return new, {"time_embed_hidden_dim": code_hidden, "time_embed_dim": code_dim, **report}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Components
 
 
-TRANSFORMER_DROP = re.compile(r"^(transformer_blocks\.\d+\.adaln_proj\.linear\.|time_embedder\.|norm_out\.linear\.)")
-TEXT_ENCODER_DROP = re.compile(
-    r"^(lm_head\.|model\.language_model\.layers\.(\d+)\.)"
-)
+TEXT_ENCODER_DROP = re.compile(r"^(lm_head\.|model\.language_model\.layers\.(\d+)\.)")
 
 
-def build_transformer(source: Path, output: Path, plans, device: str, revision: str | None) -> None:
+def build_transformer(source: Path, output: Path, plans, device: str, revision: str | None) -> dict:
     src = source / "transformer_diffusers"
     dst = output / "transformer"
     dst.mkdir(parents=True, exist_ok=True)
-    stored = read_checkpoint(src)
-    kept = [t for t in stored if not TRANSFORMER_DROP.match(t.name)]
-    dropped = sum(t.nbytes for t in stored) - sum(t.nbytes for t in kept)
-    log(f"transformer: {len(stored)} tensors, dropping {len(stored) - len(kept)} ({dropped / 1e9:.2f} GB)")
-
     started = time.perf_counter()
-    block_tables, out_table = build_tables(src, plans, device)
-    log(f"modulation tables: {sum(t.numel() for t in block_tables) * 2 / 1e6:.1f} MB in "
-        f"{time.perf_counter() - started:.0f} s on {device}")
-    new = [NewTensor(f"transformer_blocks.{i}.adaln_proj.table", t) for i, t in enumerate(block_tables)]
-    new.append(NewTensor("norm_out.table", out_table))
+    new, report = build_projections(src, plans, device)
+    log(f"coded projections in {time.perf_counter() - started:.0f} s on {device}")
+    for entry in report["plans"]:
+        log(f"  plan {entry['timesteps']}: {entry['identical_rows']}/{entry['rows']} projection rows identical to "
+            f"the original, {entry['differing']} differing elements")
+
+    stored = read_checkpoint(src)
+    names = {t.name for t in stored}
+    missing = set(new) - names
+    if missing:
+        raise RuntimeError(f"replacement tensors without an original: {sorted(missing)}")
+    entries = [NewTensor(t.name, new[t.name]) if t.name in new else t for t in stored]
+    before = sum(t.nbytes for t in stored)
+    after = sum(e.nbytes for e in entries)
+    log(f"transformer: {len(stored)} tensors, {len(new)} replaced, {before / 1e9:.2f} -> {after / 1e9:.2f} GB")
 
     notice = modification_notice(
-        "AdaLN projections, time_embedder and norm_out.linear replaced by precomputed modulation tables.", revision
+        f"time_embedder replaced by a one-hot code of the {len(report['grid'])} sampling timesteps; adaln_proj.linear "
+        f"and norm_out.linear reduced to {report['time_embed_dim']} input columns holding the original outputs for "
+        "those timesteps.",
+        revision,
     )
-    write_sharded(dst, "diffusion_pytorch_model", kept + new, {"format": "pt", "notice": notice}, log=log)
+    write_sharded(dst, "diffusion_pytorch_model", entries, {"format": "pt", "notice": notice}, log=log)
 
     cfg = json.loads((src / "config.json").read_text())
-    cfg["_class_name"] = "MiniMaxH3ImagePrunedTransformer2DModel"
-    cfg["adaln_plans"] = plans
-    cfg["reference_timestep"] = reference_timestep()
-    cfg["auto_map"] = {"AutoModel": f"{Path(MODULE_FILE).stem}.MiniMaxH3ImagePrunedTransformer2DModel"}
+    cfg["time_embed_hidden_dim"] = report["time_embed_hidden_dim"]
+    cfg["time_embed_dim"] = report["time_embed_dim"]
+    cfg["_timestep_grid"] = report["grid"]
     cfg["_notice"] = notice
     (dst / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
-    shutil.copyfile(Path(__file__).with_name("modeling.py"), dst / MODULE_FILE)
+    return report
 
 
 def build_text_encoder(source: Path, output: Path, revision: str | None) -> None:
@@ -217,20 +272,25 @@ def build_text_encoder(source: Path, output: Path, revision: str | None) -> None
         m = TEXT_ENCODER_DROP.match(name)
         if m is None:
             return True
-        return m.group(2) is not None and int(m.group(2)) < TEXT_ENCODER_LAYER
+        return m.group(2) is not None and int(m.group(2)) < TEXT_ENCODER_KEEP
 
     stored = read_checkpoint(src)
     kept = [t for t in stored if keep(t.name)]
     dropped = sum(t.nbytes for t in stored) - sum(t.nbytes for t in kept)
     log(f"text encoder: {len(stored)} tensors, dropping {len(stored) - len(kept)} ({dropped / 1e9:.2f} GB)")
     notice = modification_notice(
-        f"decoder layers {TEXT_ENCODER_LAYER}+ and lm_head removed; the pipeline reads hidden_states[{TEXT_ENCODER_LAYER}].",
+        f"decoder layers {TEXT_ENCODER_KEEP}+ and lm_head removed; the pipeline reads hidden_states"
+        f"[{TEXT_ENCODER_LAYER}], the output of layer {TEXT_ENCODER_LAYER - 1}.",
         revision,
     )
     write_sharded(dst, "model", kept, {"format": "pt", "notice": notice}, log=log)
 
     cfg = json.loads((src / "config.json").read_text())
-    cfg["text_config"]["num_hidden_layers"] = TEXT_ENCODER_LAYER
+    text_cfg = cfg["text_config"]
+    text_cfg["num_hidden_layers"] = TEXT_ENCODER_KEEP
+    for key in ("layer_types",):
+        if isinstance(text_cfg.get(key), list):
+            text_cfg[key] = text_cfg[key][:TEXT_ENCODER_KEEP]
     # `lm_head` is not stored: tie it to the input embedding so that loading allocates and initializes nothing.
     cfg["tie_word_embeddings"] = True
     cfg["_notice"] = notice
@@ -275,8 +335,6 @@ def write_modular_index(source: Path, output: Path, repo_id: str) -> None:
             spec["pretrained_model_name_or_path"] = repo_id
             spec["subfolder"] = subfolders.get(name, spec.get("subfolder"))
             spec["revision"] = None
-    index["transformer"][1] = "AutoModel"
-    index["transformer"][2]["type_hint"] = ["diffusers", "AutoModel"]
     (output / "modular_model_index.json").write_text(json.dumps(index, indent=2) + "\n")
 
 
@@ -307,7 +365,8 @@ def main(argv=None) -> None:
     plans = timestep_plans(source)
     log(f"timestep sets: {plans}")
     if "transformer" not in args.skip:
-        build_transformer(source, output, plans, args.device, args.source_revision)
+        report = build_transformer(source, output, plans, args.device, args.source_revision)
+        (output / "transformer" / "build_report.json").write_text(json.dumps(report, indent=1) + "\n")
     if "text_encoder" not in args.skip:
         build_text_encoder(source, output, args.source_revision)
     if "copies" not in args.skip:

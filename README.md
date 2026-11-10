@@ -1,62 +1,82 @@
 # MiniMax-H3-Image-Pruned
 
-Build and load scripts for [WaveCut/MiniMax-H3-Image-Pruned](https://huggingface.co/WaveCut/MiniMax-H3-Image-Pruned),
-a smaller checkpoint of [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) that produces
-the same images. The scripts work with Diffusers (Modular Diffusers pipeline) and Transformers (the Qwen3-VL text
-encoder).
+Build and verification scripts for [WaveCut/MiniMax-H3-Image-Pruned](https://huggingface.co/WaveCut/MiniMax-H3-Image-Pruned),
+a smaller checkpoint of [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image). The stock
+Diffusers and Transformers classes load it unchanged: no custom model code, no `trust_remote_code`, no package from
+this repository.
 
 ![Generation time, GPU memory and checkpoint size](assets/speed_memory_size.png)
 
 | | Original | Pruned |
 |---|---|---|
-| Transformer | 66.3 GB | 40.3 GB |
-| Text encoder | 66.7 GB | 51.5 GB |
+| Transformer | 66.3 GB | 40.2 GB |
+| Text encoder | 66.7 GB | 52.5 GB |
 | VAE | 2.3 GB | 2.3 GB |
-| Time per 4736×3552 image, RTX PRO 6000 (96 GB) | 101.2 s (model offload) | 26.3 s |
-| Images | | bit-identical |
+| Time per 4736×3552 image, RTX PRO 6000 (96 GB) | 120.8 s (model offload) | 26.4 s |
+| Text-to-image results | | bit-identical |
+| Edit results | | not bit-identical; PSNR 43.3 dB on the test edit |
 
 The time difference comes from memory: the original does not fit a 96 GB card and the offload manager moves the
 transformer and the text encoder for every image; the pruned models fit together. Per-step compute is unchanged.
 
 ## What is removed
 
-| Component | Removed | Why it is not needed |
+| Component | Change | Why it is possible |
 |---|---|---|
-| Transformer | `transformer_blocks.*.adaln_proj.linear` (13.0B parameters), `time_embedder`, `norm_out.linear` | Their input is the timestep alone, and the checkpoint samples on one fixed grid: six steps plus t = 0.999 for the reference rows of an edit. Their outputs for that grid are stored as tables (116 MB). The audio third of every projection, which the image model never addresses, is not stored at all. |
-| Transformer, last block | Queries, attention output and feed-forward of the text rows and reference rows | Nothing reads these rows after the last block; they still provide keys and values. Runtime only, `transformer.skip_dead_rows`. |
-| Text encoder | Decoder layers 50-63 and `lm_head` (15.2B parameters) | The transformer is conditioned on `hidden_states[50]`, the output of layer 49 before the final norm. |
+| Transformer | `transformer_blocks.*.adaln_proj.linear` [96768, 2688] → [96768, 8], `norm_out.linear` [10752, 2688] → [10752, 8], `time_embedder` 5376 → 16 hidden units (13.0B parameters removed) | The input of these layers is the timestep alone, and the checkpoint samples on one fixed grid: six steps, plus t = 0.999 for the reference rows of an edit. Seven timesteps need seven input columns (eight, with one padding column). |
+| Text encoder | Decoder layers 51-63 and `lm_head` (7.1B parameters, 14.2 GB) | The transformer is conditioned on `hidden_states[50]`, the output of layer 49 before the final norm. Layer 50 stays: the pipeline refuses a conditioner with 50 layers or fewer, and with 51 layers `hidden_states[50]` is still the output of layer 49. `lm_head` is tied to the input embedding, so loading allocates nothing for it. |
 
-The VAE, tokenizer, processor and scheduler are the original files.
+The VAE, tokenizer, processor and scheduler are the original files. Every kept tensor is a byte copy.
 
-### Modulation tables
+### How the transformer stays a stock model
 
-Each block's AdaLN projection maps `silu(time_embedder(t))` to six modulation vectors for each of three modalities.
-`prune.py` runs the original `time_proj`, `time_embedder` and projection modules on every `timestep` tensor the pipeline
-passes (one value per text-to-image step; the step value and 0.999 per edit step) and keeps the image and text rows of
-the result. The pruned model looks the rows up instead of computing them, then runs the original block code.
+The stock `MiniMaxH3ImageTransformer2DModel` takes `time_embed_dim` and `time_embed_hidden_dim` from its config.
+The pruned config sets them to 8 and 16, and the weights are built so that the stock forward pass returns the
+original modulation values:
 
-Matrix products can round differently with a different number of rows, so the tables keep each timestep set as the
-pipeline sends it: one row for a text-to-image step, two rows for an edit step. Built on the same GPU type, the pruned
-transformer returns bit-identical outputs. On another GPU type the original model's own adaptive-norm outputs differ by
-single bfloat16 rounding steps in a few entries; the tables keep the values of the build GPU.
+* `time_embedder` maps each of the seven grid timesteps to a one-hot code. Its hidden layer has two hinge units per gap
+  between neighbouring grid points of `sin(t)` (a `time_proj` feature); output k is 32 at t_k and below -300 at every
+  other grid point. The stock AdaLN modules compute `silu(temb)` in float32 and cast it to bfloat16, which gives exactly
+  `32 * e_k`: `silu(32)` is 32, and `silu(x)` is 0 below about -89 (the exponential overflows float32).
+* Column k of each `adaln_proj.linear` and of `norm_out.linear` holds the original projection's output for t_k divided
+  by 32 (exact in bfloat16), and the bias is zero. The product with `32 * e_k` has a single nonzero term, so the layer
+  returns the stored row exactly, on any GPU and for any number of rows.
 
-The tables cover only the release's sampling grid. Any other timestep raises an error.
+`prune.py` checks the codes with float32, TF32 and bfloat16 matmuls, checks that every stored column multiplied by 32
+reproduces the original row, and compares the coded projections with the original ones for every timestep set the
+pipeline uses.
+
+### Text-to-image and edit
+
+A matrix product can round differently with a different number of rows. The pipeline calls the original projections
+with one timestep per text-to-image step and two (the step and 0.999) per edit step, so the original model itself
+produces slightly different modulation values for the same step in the two modes. A stock time embedder sees each
+timestep separately and cannot tell the modes apart, so the checkpoint stores one value per timestep: the
+text-to-image one for the six steps, and the edit one for 0.999 (identical in all edit steps).
+
+* Text-to-image: bit-identical to the original on the build GPU type.
+* Edit: not bit-identical. 59,279 of the 29.1 million modulation values of the six step rows (0.20 %) differ from the original's two-row result by rounding steps. Through the 50 blocks this changes each edit step's transformer output by 2.1-2.5 % (relative L2), and the 2048×2048 test edit by PSNR 43.3 dB: mean absolute difference 0.63 of 255, 261 of 4.2 million pixels off by more than 64. In the worst region the differences follow edges; the two images look the same.
 
 ## Use
 
 ```bash
-pip install "git+https://github.com/iamwavecut/MiniMax-H3-Image-Pruned"
+pip install "diffusers @ git+https://github.com/huggingface/diffusers@875373ac7f5856071e345a3e394c74efccc6b9e6" \
+  "transformers>=5.22" accelerate torchvision
 ```
 
-The package needs Diffusers with MiniMax-H3-Image support (merged after 0.41; until a release, install
-`diffusers @ git+https://github.com/huggingface/diffusers@875373ac7f5856071e345a3e394c74efccc6b9e6`) and
-`transformers>=5.22`.
+MiniMax-H3-Image support was merged into Diffusers after 0.41; until a release contains it, install Diffusers from
+git as above. The pruned checkpoint loads like the original:
 
 ```python
 import torch
-from minimax_h3_image_pruned import load_pipeline
+from diffusers import ComponentsManager, ModularPipeline
 
-pipe = load_pipeline("WaveCut/MiniMax-H3-Image-Pruned")  # auto CPU offload; offload=False keeps all on the GPU
+manager = ComponentsManager()
+manager.enable_auto_cpu_offload(device="cuda")  # or skip this and call pipe.to("cuda") on a GPU with 96 GB or more
+
+pipe = ModularPipeline.from_pretrained("WaveCut/MiniMax-H3-Image-Pruned", components_manager=manager)
+pipe.load_components(dtype=torch.bfloat16)
+
 image = pipe(
     prompt=open("prompt.txt").read(),
     height=3552,
@@ -67,48 +87,35 @@ image = pipe(
 ```
 
 Edit: pass `image=reference` (or a list) and refer to the references as `<Picture 1>`, `<Picture 2>`, ... in the
-prompt. `scripts/generate.py` wraps both.
+prompt. `scripts/generate.py` wraps both and uses only Diffusers and Transformers.
 
-### Components separately
-
-Transformer, with Diffusers' remote code instead of this package:
+The components also load on their own with the stock classes:
 
 ```python
-from diffusers import AutoModel
-
-transformer = AutoModel.from_pretrained(
-    "WaveCut/MiniMax-H3-Image-Pruned", subfolder="transformer", trust_remote_code=True, torch_dtype=torch.bfloat16
-)
-```
-
-Text encoder (Transformers). The checkpoint holds layers 0-49. `adapt_text_encoder` replaces the final norm with an
-identity, so the last hidden state is the conditioning, and reports 51 layers to pass the pipeline's depth check:
-
-```python
+from diffusers import MiniMaxH3ImageTransformer2DModel
 from transformers import Qwen3VLForConditionalGeneration
-from minimax_h3_image_pruned import adapt_text_encoder
 
-text_encoder = adapt_text_encoder(
-    Qwen3VLForConditionalGeneration.from_pretrained(
-        "WaveCut/MiniMax-H3-Image-Pruned", subfolder="text_encoder", dtype=torch.bfloat16
-    )
+transformer = MiniMaxH3ImageTransformer2DModel.from_pretrained(
+    "WaveCut/MiniMax-H3-Image-Pruned", subfolder="transformer", torch_dtype=torch.bfloat16
 )
-hidden = text_encoder.model(input_ids=ids, output_hidden_states=True, use_cache=False).hidden_states[50]
+text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+    "WaveCut/MiniMax-H3-Image-Pruned", subfolder="text_encoder", dtype=torch.bfloat16
+)
 ```
 
-`lm_head` is tied to the input embedding so that loading allocates nothing for it; the truncated model is not a usable
-language model.
+The truncated text encoder is a conditioner, not a usable language model.
 
 ## Build the checkpoint yourself
 
 ```bash
+pip install "git+https://github.com/iamwavecut/MiniMax-H3-Image-Pruned"
 minimax-h3-image-prune --output ./MiniMax-H3-Image-Pruned --device cuda
 ```
 
 It downloads the needed files of `MiniMaxAI/MiniMax-H3-Image` (135 GB) unless `--source` names a local copy, copies
-every kept tensor byte for byte, and computes the tables on `--device` (5 s and about 1 GB of GPU memory on an RTX
-PRO 6000; the whole build took 59 s on a pod with fast local disk). `--skip text_encoder copies` builds only the
-transformer.
+every kept tensor byte for byte, and computes the coded projections on `--device` with the original modules
+(28 s for the projections on an RTX PRO 6000; the whole build took 110 s on a pod with fast local disk). `--skip text_encoder copies` builds only the transformer. `build_report.json` in the output's
+`transformer/` lists, per timestep set, how many projection rows match the original exactly.
 
 ## Verify
 
@@ -118,15 +125,26 @@ python scripts/verify.py pruned --source ./MiniMax-H3-Image --pruned ./MiniMax-H
 python scripts/verify.py compare --work ./verify
 ```
 
-`reference` runs the official pipeline and records every transformer call; `pruned` runs the pruned pipeline on the
-same prompts and seeds and replays the recorded calls through the pruned transformer. `compare` reports whether the
-text conditioning, transformer outputs and images are bit-identical, with time and GPU memory for each run.
+`reference` runs the official pipeline and records every transformer call; `pruned` loads the pruned checkpoint with
+the same stock classes, runs the same prompts and seeds, and replays the recorded calls through the pruned transformer.
+`compare` reports whether the text conditioning, the transformer outputs and the images are bit-identical, how far they
+differ where they are not, and the time and GPU memory of each run.
 
 ## Limits
 
-* Only the release's six-step grid. The pruned transformer cannot run other timesteps or step counts.
-* Diffusers context parallelism and tensor parallelism plans are not carried over.
-* SGLang and ComfyUI load the original layout; they need their own loaders for this checkpoint.
+* Only the release's sampling grid. A timestep off the grid gives no valid code, and the stock model does not check
+  for it: the output is wrong without an error. The original has one output head per step of this grid and cannot
+  change it either.
+* The stored values come from the build GPU (RTX PRO 6000 Blackwell). On another GPU type the original model can round
+  its own projections differently by single bfloat16 steps; rebuild the transformer there
+  (`minimax-h3-image-prune --skip text_encoder copies`) to match the original on that GPU.
+* SGLang and ComfyUI load the original layout; they were not tested with this checkpoint.
+
+## Previous format
+
+The first release (Hub revision `3a804c0f`, package tag `v0.1.0`) stored the modulation as tables and needed
+this package's model class and text-encoder adapter. It was bit-identical in edits too. The current format trades
+that for loading with the stock classes.
 
 ## License
 
