@@ -21,19 +21,27 @@ ap.add_argument("--image", action="append", default=[], help="reference image (r
 ap.add_argument("--size", default="2048x2048", help="WIDTHxHEIGHT of the returned image")
 ap.add_argument("--seed", type=int, default=42)
 ap.add_argument("--repo", default="WaveCut/MiniMax-H3-Image-Pruned", help="Hub repository or local folder")
-ap.add_argument("--resident", action="store_true", help="keep every component on the GPU (about 95 GB)")
+ap.add_argument("--offload", choices=["auto", "one-model", "none"], default="auto",
+                help="auto: move a model off the GPU only when the next one does not fit; one-model: only one model on "
+                     "the GPU at a time (lowest peak, slower); none: every component on the GPU (about 95 GB)")
+ap.add_argument("--resident", action="store_true", help="same as --offload none")
 ap.add_argument("--out", default="image.png")
 args = ap.parse_args()
 
+offload = "none" if args.resident else args.offload
 manager = ComponentsManager()
-if not args.resident:
+if offload in ("auto", "one-model"):
     manager.enable_auto_cpu_offload(device="cuda")
 pipe = ModularPipeline.from_pretrained(args.repo, components_manager=manager)
 load_kwargs = {"dtype": torch.bfloat16}
 if Path(args.repo).is_dir():  # a local copy: its modular_model_index.json still names the Hub repository
     load_kwargs["pretrained_model_name_or_path"] = args.repo
 pipe.load_components(**load_kwargs)
-if args.resident:
+if offload == "one-model":
+    # Every other model leaves the GPU before the next one loads. Set after loading: adding a component
+    # re-enables offloading with the default strategy.
+    manager.set_offload_strategy(lambda hooks, **kwargs: hooks)
+if offload == "none":
     pipe.to("cuda")
 
 prompt = args.prompt if args.prompt is not None else args.prompt_file.read_text().strip()

@@ -12,12 +12,15 @@ this repository.
 | Transformer | 66.3 GB | 40.2 GB |
 | Text encoder | 66.7 GB | 52.5 GB |
 | VAE | 2.3 GB | 2.3 GB |
-| Time per 4736×3552 image, RTX PRO 6000 (96 GB) | 120.8 s (model offload) | 26.4 s |
+| Time per 4736×3552 image, RTX PRO 6000 (96 GB) | 120.8 s (model offload, 68.2 GiB peak) | 26.7 s (all on the GPU, 92.7 GiB peak); 92.8 s (one model on the GPU at a time, 50.4 GiB peak) |
 | Text-to-image results | | bit-identical |
 | Edit results | | not bit-identical; PSNR 43.3 dB on the test edit |
 
 The time difference comes from memory: the original does not fit a 96 GB card and the offload manager moves the
-transformer and the text encoder for every image; the pruned models fit together. Per-step compute is unchanged.
+transformer and the text encoder for every image; the pruned models fit together. With one model on the GPU at a time
+the pruned checkpoint also moves both models for every image, with 30 % less data and a 50.4 GiB peak. Per-step
+compute is unchanged. All numbers come from one machine; see the
+[model card](https://huggingface.co/WaveCut/MiniMax-H3-Image-Pruned#profiles) for 2048×2048 and edit times.
 
 ## What is removed
 
@@ -88,6 +91,22 @@ image = pipe(
 
 Edit: pass `image=reference` (or a list) and refer to the references as `<Picture 1>`, `<Picture 2>`, ... in the
 prompt. `scripts/generate.py` wraps both and uses only Diffusers and Transformers.
+
+### Memory modes
+
+`enable_auto_cpu_offload` moves a model off the GPU only when the next one does not fit. On a 96 GB card the pruned
+models fit together, so after the first image nothing moves and the run is as fast as with everything on the GPU
+(peak 92.7 GiB). For the lowest peak, keep one model on the GPU at a time; set the strategy after loading, because
+adding the components resets it to the default:
+
+```python
+pipe.load_components(dtype=torch.bfloat16)
+manager.set_offload_strategy(lambda hooks, **kwargs: hooks)  # move every other model off the GPU first
+```
+
+The peak is then 50-52 GiB, set by the text encoder (48.9 GiB of weights), and each image moves both models over
+PCIe: 72.2 s at 2048×2048 instead of 5.6 s on an RTX PRO 6000. The images are bit-identical to the all-on-GPU ones.
+`scripts/generate.py --offload one-model` and `scripts/verify.py pruned --offload one-model` use this mode.
 
 The components also load on their own with the stock classes:
 

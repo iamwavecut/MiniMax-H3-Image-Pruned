@@ -1,14 +1,20 @@
 """Check the pruned MiniMax-H3-Image against the original release, and time both.
 
     python verify.py reference --source ./MiniMax-H3-Image --work ./verify
-    python verify.py pruned --source ./MiniMax-H3-Image --pruned ./MiniMax-H3-Image-Pruned --work ./verify [--resident]
+    python verify.py pruned --source ./MiniMax-H3-Image --pruned ./MiniMax-H3-Image-Pruned --work ./verify \
+        [--offload auto|one-model|none]
     python verify.py compare --work ./verify
 
 `reference` runs the official Modular Diffusers pipeline (bfloat16, auto CPU offload) on the cases below and records
-every transformer call. `pruned` loads the pruned checkpoint with the same stock classes, runs the same cases and feeds
-the recorded calls to the pruned transformer. `compare` reports, per case: whether the text conditioning, the
-transformer outputs and the images are bit-identical (and how far they differ when they are not), and the time and
-GPU memory of each run.
+every transformer call. `pruned` loads the pruned checkpoint with the same stock classes, runs the same cases and, with
+the default offload, feeds the recorded calls to the pruned transformer.
+
+`compare` reports, per case: whether the text conditioning, the transformer outputs and the images are bit-identical
+(and how far they differ when they are not), and the time and GPU memory of each run.
+
+Offload modes (`ComponentsManager`): `auto` is the stock strategy, which moves a model off the GPU only when the next
+one does not fit, so on a 96 GB card the pruned models all stay on the GPU. `one-model` moves every other model off the
+GPU before the next one loads (the lowest peak). `none` puts every component on the GPU.
 """
 
 from __future__ import annotations
@@ -43,10 +49,7 @@ def log(**kw):
 
 
 class Peak:
-    """Whole-GPU memory peak from NVML, sampled every 50 ms.
-
-    Polling every 5 ms slowed the Qwen3-VL vision tower (many small kernels) by seconds on driver 615.
-    """
+    """Whole-GPU memory peak from NVML, sampled every 50 ms in a background thread."""
 
     def __init__(self, index=0):
         import pynvml
@@ -160,19 +163,27 @@ def reference(args):
     print("REFERENCE_DONE", flush=True)
 
 
-def load_stock(path: Path, resident: bool):
+def offload_others(hooks, model_id, model, execution_device):
+    """`ComponentsManager` offload strategy: move every other model off the GPU before the next one loads."""
+    return hooks
+
+
+def load_stock(path: Path, offload: str):
     """The checkpoint at `path` in the stock `ModularPipeline`, as the official card loads the original."""
     from diffusers import ComponentsManager, ModularPipeline
 
     manager = ComponentsManager()
-    if not resident:
+    if offload in ("auto", "one-model"):
         manager.enable_auto_cpu_offload(device="cuda")
     pipe = ModularPipeline.from_pretrained(str(path), components_manager=manager)
     pipe.load_components(dtype=torch.bfloat16, pretrained_model_name_or_path=str(path))
+    if offload == "one-model":
+        # Set after loading: adding a component re-enables offloading with the default strategy.
+        manager.set_offload_strategy(offload_others)
     for name in ("transformer", "text_encoder", "vae", "tokenizer", "processor", "scheduler"):
         if getattr(pipe, name, None) is None:
             raise RuntimeError(f"{name} did not load")
-    if resident:
+    if offload == "none":
         pipe.to("cuda")
     return pipe
 
@@ -195,14 +206,15 @@ def transformer_check(transformer, ref_dir: Path):
 
 
 def pruned(args):
-    pipe = load_stock(args.pruned, args.resident)
-    label = "pruned-resident" if args.resident else "pruned"
+    offload = "none" if args.resident else args.offload
+    pipe = load_stock(args.pruned, offload)
+    label = {"auto": "pruned", "one-model": "pruned-one-model", "none": "pruned-resident"}[offload]
     log(loaded=label, transformer=type(pipe.transformer).__name__,
         time_embed_dim=pipe.transformer.config.time_embed_dim,
         te_layers=pipe.text_encoder.config.text_config.num_hidden_layers)
-    cases = CASES if not args.resident else [c | {"capture": False} for c in CASES]
+    cases = CASES if offload == "auto" else [c | {"capture": False} for c in CASES]
     run_cases(pipe, args.source or args.pruned, args.work / label, cases, label)
-    if not args.resident:
+    if offload == "auto":
         rows = transformer_check(pipe.transformer, args.work / "reference")
         (args.work / "transformer_check.json").write_text(json.dumps(rows, indent=1))
         log(transformer_check={"calls": len(rows), "identical": sum(r["identical"] for r in rows)})
@@ -231,7 +243,7 @@ def compare(args):
     ref = args.work / "reference"
     result = {"images": {}, "conditioning": {}, "runs": []}
     for case in CASES:
-        for label in ("pruned", "pruned-resident"):
+        for label in ("pruned", "pruned-one-model", "pruned-resident"):
             got = args.work / label / f"{case['id']}.png"
             if got.exists() and (ref / f"{case['id']}.png").exists():
                 result["images"][f"{label}/{case['id']}"] = image_diff(ref / f"{case['id']}.png", got)
@@ -259,7 +271,9 @@ def main():
     ap.add_argument("--source", type=Path, help="local MiniMaxAI/MiniMax-H3-Image (prompts, reference image)")
     ap.add_argument("--pruned", type=Path)
     ap.add_argument("--work", type=Path, required=True)
-    ap.add_argument("--resident", action="store_true", help="pruned: keep every component on the GPU (no offload)")
+    ap.add_argument("--offload", choices=["auto", "one-model", "none"], default="auto",
+                    help="pruned: ComponentsManager offload mode (see above)")
+    ap.add_argument("--resident", action="store_true", help="pruned: same as --offload none")
     args = ap.parse_args()
     {"reference": reference, "pruned": pruned, "compare": compare}[args.mode](args)
 
